@@ -1,297 +1,538 @@
-import express, { Request, Response } from 'express';
-import { GoogleGenAI, Type } from '@google/genai';
-import path from 'path';
-import dotenv from 'dotenv';
-import { parseCommandLocally } from './src/utils/commandParser.ts';
-import type { ReceiptData, ChatMessage } from './src/types/receipt.ts';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
+import { SAMPLE_RECEIPTS } from './data/sampleReceipts.ts';
+import { Header } from './components/Header.tsx';
+import { ReceiptPane } from './components/ReceiptPane.tsx';
+import { ChatPane } from './components/ChatPane.tsx';
+import { BreakdownSummary } from './components/BreakdownSummary.tsx';
+import { ReceiptUploadModal } from './components/ReceiptUploadModal.tsx';
+import { ItemAssignModal } from './components/ItemAssignModal.tsx';
+import { AddItemModal } from './components/AddItemModal.tsx';
+import { calculateBillSummary, generateShareText } from './utils/splitCalculator.ts';
+import type { ReceiptData, ReceiptItem, ChatMessage } from './types/receipt.ts';
+import { Receipt as ReceiptIcon, MessageSquare, Check, Sparkles } from 'lucide-react';
 
-dotenv.config();
+const calculateSubtotal = (items: ReceiptItem[]) =>
+  items.reduce((sum, item) => sum + item.price * (item.quantity || 1), 0);
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-const isProduction = process.env.NODE_ENV === 'production';
+const normaliseReceiptTotals = (receipt: ReceiptData, items = receipt.items): ReceiptData => {
+  const subtotal = calculateSubtotal(items);
+  const tax = Number(receipt.tax) || 0;
+  const tip = Number(receipt.tip) || 0;
 
-// Parse large JSON payloads for base64 receipt images
-app.use(express.json({ limit: '30mb' }));
-app.use(express.urlencoded({ extended: true, limit: '30mb' }));
+  return {
+    ...receipt,
+    items,
+    subtotal,
+    tax,
+    tip,
+    total: subtotal + tax + tip,
+  };
+};
 
-// Initialize GoogleGenAI SDK server-side
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY || '',
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
+export default function App() {
+  const [currentReceipt, setCurrentReceipt] = useState<ReceiptData>(SAMPLE_RECEIPTS[0]);
+  const [knownParticipants, setKnownParticipants] = useState<string[]>(['Dhruv', 'Sarah', 'Sue']);
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
+  const [isAddItemModalOpen, setIsAddItemModalOpen] = useState(false);
+  const [selectedItemForAssign, setSelectedItemForAssign] = useState<ReceiptItem | null>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [mobileActiveTab, setMobileActiveTab] = useState<'receipt' | 'chat'>('receipt');
+
+  const receiptRef = useRef(currentReceipt);
+  const participantsRef = useRef(knownParticipants);
+  const messagesRef = useRef<ChatMessage[]>([]);
+
+  useEffect(() => {
+    receiptRef.current = currentReceipt;
+  }, [currentReceipt]);
+
+  useEffect(() => {
+    participantsRef.current = knownParticipants;
+  }, [knownParticipants]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  // Multi-turn conversation messages
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    {
+      id: 'welcome-1',
+      role: 'system',
+      content:
+        '👋 Welcome to SplitSense AI! I have parsed the receipt for ' +
+        SAMPLE_RECEIPTS[0].merchantName +
+        '. You can assign items using natural language commands below or tap on dishes directly.',
+      timestamp: Date.now() - 60000,
     },
-  },
-});
-
-/**
- * Receipt image parser endpoint
- */
-app.post('/api/parse-receipt', async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { imageBase64, mimeType = 'image/jpeg' } = req.body;
-
-    if (!imageBase64) {
-      res.status(400).json({ error: 'No image provided' });
-      return;
-    }
-
-    // Clean base64 string if it contains data URI prefix
-    const base64Data = imageBase64.replace(/^data:image\/[a-zA-Z]+;base64,/, '');
-
-    const prompt = `Analyze this receipt photo. Extract all individual line items with their names, quantities, and prices.
-Also extract the merchant name, date/time if visible, subtotal, tax amount, and any tip if listed.
-Make sure item prices are numbers (e.g. 14.50, not "$14.50").
-If there are multiple identical items or combos, list them cleanly.
-Return the result in valid JSON.`;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              inlineData: {
-                mimeType,
-                data: base64Data,
-              },
-            },
-            {
-              text: prompt,
-            },
-          ],
-        },
+    {
+      id: 'welcome-2',
+      role: 'assistant',
+      content:
+        'Try saying: "Dhruv had the nachos", "Sarah and Sue shared the pizza", or "Add 18% tip". Tax and tip will automatically distribute proportionally to each person\'s subtotal!',
+      timestamp: Date.now() - 50000,
+      suggestedActions: [
+        'Dhruv had the nachos',
+        'Sarah and Sue shared the pizza',
+        'Add 20% tip',
       ],
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            merchantName: { type: Type.STRING },
-            date: { type: Type.STRING },
-            items: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  price: { type: Type.NUMBER },
-                  quantity: { type: Type.INTEGER },
-                  category: { type: Type.STRING },
-                },
-                required: ['name', 'price'],
-              },
-            },
-            subtotal: { type: Type.NUMBER },
-            tax: { type: Type.NUMBER },
-            tip: { type: Type.NUMBER },
-            total: { type: Type.NUMBER },
-          },
-          required: ['merchantName', 'items'],
-        },
+    },
+  ]);
+
+  // Dynamic suggested prompts
+  const [suggestedPrompts, setSuggestedPrompts] = useState<string[]>([
+    'Dhruv had the nachos',
+    'Sarah and Sue shared the pizza',
+    'Split unassigned items equally',
+    'Add 20% tip',
+  ]);
+
+  // Compute real-time bill summary with proportional tax & tip
+  const summary = useMemo(() => {
+    return calculateBillSummary(currentReceipt, knownParticipants);
+  }, [currentReceipt, knownParticipants]);
+
+  // Show a momentary toast notification
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    window.clearTimeout((showToast as any)._timer);
+    (showToast as any)._timer = window.setTimeout(() => setToastMessage(null), 3000);
+  };
+
+  // Switch sample receipt
+  const handleSelectSample = (sampleId: string) => {
+    const sample = SAMPLE_RECEIPTS.find((r) => r.id === sampleId);
+    if (!sample) return;
+
+    const nextReceipt = JSON.parse(JSON.stringify(sample));
+    setCurrentReceipt(nextReceipt);
+    setMessages([
+      {
+        id: 'new-receipt-' + Date.now(),
+        role: 'system',
+        content: `Loaded receipt for "${sample.merchantName}" (${sample.items.length} items, total $${sample.total.toFixed(2)}).`,
+        timestamp: Date.now(),
       },
-    });
+      {
+        id: 'new-receipt-prompt-' + Date.now(),
+        role: 'assistant',
+        content: `Tell me who ordered which dish, or tell me to split everything equally!`,
+        timestamp: Date.now(),
+      },
+    ]);
+    setSuggestedPrompts([
+      `Dhruv had the ${sample.items[0]?.name || 'first dish'}`,
+      'Sarah and Sue shared the pizza',
+      'Split unassigned items equally',
+      'Add 20% tip',
+    ]);
+  };
 
-    const text = response.text || '{}';
-    const parsed = JSON.parse(text);
+  // Uploaded parsed receipt handler
+  const handleReceiptParsed = (newReceipt: ReceiptData) => {
+    setCurrentReceipt(newReceipt);
+    setMessages([
+      {
+        id: 'parsed-' + Date.now(),
+        role: 'system',
+        content: `🎉 Successfully analyzed receipt for "${newReceipt.merchantName}" via Gemini OCR! Extracted ${newReceipt.items.length} line items.`,
+        timestamp: Date.now(),
+      },
+      {
+        id: 'parsed-bot-' + Date.now(),
+        role: 'assistant',
+        content: `Who had which items? You can say things like "Alex had the ${newReceipt.items[0]?.name || 'first item'}" or "Sam and Bob shared the main dish".`,
+        timestamp: Date.now(),
+      },
+    ]);
+    showToast(`Receipt parsed: ${newReceipt.items.length} items detected!`);
+  };
 
-    // Format into standard ReceiptData format
-    const receiptData: ReceiptData = {
-      id: 'receipt-' + Date.now(),
-      merchantName: parsed.merchantName || 'Restaurant Receipt',
-      date: parsed.date || new Date().toLocaleString(),
-      items: (parsed.items || []).map((item: any, idx: number) => ({
-        id: `parsed-item-${idx + 1}`,
-        name: item.name || `Item ${idx + 1}`,
-        price: Number(item.price) || 0,
-        quantity: Number(item.quantity) || 1,
-        assignedTo: [],
-        category: item.category || 'General',
-      })),
-      subtotal: Number(parsed.subtotal) || 0,
-      tax: Number(parsed.tax) || 0,
-      tip: Number(parsed.tip) || 0,
-      tipType: 'percentage',
-      tipPercentage: 18,
-      total: Number(parsed.total) || 0,
+  // Send natural language command to chat endpoint
+  const handleSendMessage = async (userText: string) => {
+    const userMsg: ChatMessage = {
+      id: 'user-' + Date.now(),
+      role: 'user',
+      content: userText,
+      timestamp: Date.now(),
     };
 
-    // Calculate subtotal if not provided
-    if (!receiptData.subtotal || receiptData.subtotal === 0) {
-      receiptData.subtotal = receiptData.items.reduce(
-        (sum, it) => sum + it.price * (it.quantity || 1),
-        0
-      );
-    }
-    // Set default total if missing
-    if (!receiptData.total || receiptData.total === 0) {
-      receiptData.total = receiptData.subtotal + receiptData.tax + receiptData.tip;
-    }
+    const receiptSnapshot = receiptRef.current;
+    const participantSnapshot = participantsRef.current;
+    const conversationSnapshot = messagesRef.current;
 
-    res.json({ success: true, receipt: receiptData });
-  } catch (error: any) {
-    console.error('Error parsing receipt with Gemini:', error);
-    res.status(500).json({
-      error: 'Failed to parse receipt image. ' + (error?.message || ''),
-    });
-  }
-});
+    setMessages((prev) => [...prev, userMsg]);
+    setIsChatLoading(true);
 
-/**
- * Natural language chat command endpoint
- */
-app.post('/api/chat-command', async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { message, receipt, conversation = [], knownParticipants = [] } = req.body;
-
-    if (!message || !receipt) {
-      res.status(400).json({ error: 'Message and receipt are required' });
-      return;
-    }
-
-    // Try Gemini first
     try {
-      const itemsContext = (receipt.items || []).map((i: any) => ({
-        id: i.id,
-        name: i.name,
-        price: i.price,
-        quantity: i.quantity,
-        assignedTo: i.assignedTo,
-      }));
+      const response = await fetch('/api/chat-command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: userText,
+          receipt: receiptSnapshot,
+          conversation: conversationSnapshot,
+          knownParticipants: participantSnapshot,
+        }),
+      });
 
-      const systemInstruction = `You are SplitSense AI, an intelligent split-screen bill splitting assistant.
-Your job is to parse the user's natural language command, adjust who ordered what on the receipt, and answer their questions.
-Current Receipt Items:
-${JSON.stringify(itemsContext, null, 2)}
-Subtotal: $${receipt.subtotal}, Tax: $${receipt.tax}, Tip: $${receipt.tip}.
-Known Participants: ${JSON.stringify(knownParticipants)}
+      const data = await response.json();
 
-When users say things like:
-- "Dhruv had the nachos" -> match "nachos" to the item ID (e.g. "Loaded Beef Nachos"), set assignedTo = ["Dhruv"].
-- "Sarah and Sue shared the pizza" -> match "pizza", set assignedTo = ["Sarah", "Sue"].
-- "Alex and Bob split the drinks" -> match drink item(s), set assignedTo = ["Alex", "Bob"].
-- "Actually Sarah didn't have the nachos" -> remove Sarah from the nachos item.
-- "Add 20% tip" / "Tip is $15" -> update tip.
-- "Split the unassigned items equally" -> assign all items that currently have assignedTo.length == 0 to all known participants.
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to process command');
+      }
 
-Provide your response strictly in the specified JSON schema.
-- reply: A friendly, concise 1-2 sentence response explaining what was updated.
-- itemUpdates: Array of { itemId, assignedTo, action: "replace" | "add" | "remove" }.
-- tipUpdate: Optional { type: "percentage" | "amount", value: number }.
-- newParticipants: Array of string names newly mentioned.
-- suggestedActions: Array of 2-3 quick follow-up prompt suggestions.`;
+      // Apply updates to receipt items
+      let updatedItems = [...receiptSnapshot.items];
+      const newlyAddedPeople: string[] = [...(data.newParticipants || [])];
 
-      // Build conversation history for multi-turn chat
-      const contents: any[] = [];
-      const recentHistory = (conversation as ChatMessage[]).slice(-6);
-      recentHistory.forEach((msg) => {
-        contents.push({
-          role: msg.role === 'assistant' ? 'model' : 'user',
-          parts: [{ text: msg.content }],
+      if (data.itemUpdates && data.itemUpdates.length > 0) {
+        data.itemUpdates.forEach((update: any) => {
+          const itemIdx = updatedItems.findIndex((it) => it.id === update.itemId);
+          if (itemIdx !== -1) {
+            const currentItem = updatedItems[itemIdx];
+            let nextAssignees: string[] = [];
+
+            if (update.action === 'add') {
+              nextAssignees = Array.from(
+                new Set([...currentItem.assignedTo, ...update.assignedTo])
+              );
+            } else if (update.action === 'remove') {
+              nextAssignees = currentItem.assignedTo.filter(
+                (p) => !update.assignedTo.includes(p)
+              );
+            } else {
+              // replace / set
+              nextAssignees = update.assignedTo;
+            }
+
+            updatedItems[itemIdx] = {
+              ...currentItem,
+              assignedTo: nextAssignees,
+            };
+
+            nextAssignees.forEach((p) => {
+              if (!newlyAddedPeople.includes(p) && !participantSnapshot.includes(p)) {
+                newlyAddedPeople.push(p);
+              }
+            });
+          }
         });
-      });
-      // Append current message
-      contents.push({
-        role: 'user',
-        parts: [{ text: message }],
-      });
+      }
 
-      const geminiResponse = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents,
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              reply: { type: Type.STRING },
-              itemUpdates: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    itemId: { type: Type.STRING },
-                    assignedTo: {
-                      type: Type.ARRAY,
-                      items: { type: Type.STRING },
-                    },
-                    action: { type: Type.STRING },
-                  },
-                  required: ['itemId', 'assignedTo'],
-                },
-              },
-              tipUpdate: {
-                type: Type.OBJECT,
-                properties: {
-                  type: { type: Type.STRING },
-                  value: { type: Type.NUMBER },
-                },
-              },
-              newParticipants: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-              },
-              suggestedActions: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-              },
-            },
-            required: ['reply', 'itemUpdates'],
-          },
+      // Tip or tax updates
+      let updatedTip = receiptSnapshot.tip;
+      let updatedTipPercentage = receiptSnapshot.tipPercentage;
+      let updatedTax = receiptSnapshot.tax;
+
+      if (data.tipUpdate) {
+        if (data.tipUpdate.type === 'percentage') {
+          const pct = data.tipUpdate.value;
+          updatedTipPercentage = pct;
+          const subtotal = calculateSubtotal(updatedItems);
+          updatedTip = Math.round(subtotal * (pct / 100) * 100) / 100;
+        } else {
+          updatedTip = data.tipUpdate.value;
+        }
+      }
+
+      if (data.taxUpdate?.amount) {
+        updatedTax = data.taxUpdate.amount;
+      }
+
+      const nextReceipt = normaliseReceiptTotals(
+        {
+          ...receiptSnapshot,
+          items: updatedItems,
+          tax: updatedTax,
+          tip: updatedTip,
+          tipPercentage: updatedTipPercentage,
         },
-      });
+        updatedItems
+      );
 
-      const text = geminiResponse.text || '{}';
-      const parsed = JSON.parse(text);
+      setCurrentReceipt(nextReceipt);
 
-      res.json({
-        reply: parsed.reply,
-        itemUpdates: parsed.itemUpdates || [],
-        tipUpdate: parsed.tipUpdate,
-        newParticipants: parsed.newParticipants || [],
-        suggestedActions: parsed.suggestedActions || [
-          'Split unassigned items equally',
-          'Add 18% tip',
-          'Who owes what?',
-        ],
-      });
-      return;
-    } catch (geminiError) {
-      console.warn('Gemini chat command error, falling back to local NLP parser:', geminiError);
-      // Fallback to local rule engine
-      const localResult = parseCommandLocally(message, receipt, knownParticipants);
-      res.json(localResult);
+      if (newlyAddedPeople.length > 0) {
+        setKnownParticipants((prev) =>
+          Array.from(new Set([...prev, ...newlyAddedPeople]))
+        );
+      }
+
+      // Append assistant message
+      const botMsg: ChatMessage = {
+        id: 'bot-' + Date.now(),
+        role: 'assistant',
+        content: data.reply || 'Got it! Receipt split updated.',
+        timestamp: Date.now(),
+        actionSummary:
+          data.itemUpdates && data.itemUpdates.length > 0
+            ? `Updated ${data.itemUpdates.length} item(s)`
+            : undefined,
+      };
+
+      setMessages((prev) => [...prev, botMsg]);
+
+      if (data.suggestedActions && data.suggestedActions.length > 0) {
+        setSuggestedPrompts(data.suggestedActions);
+      }
+    } catch (err: any) {
+      console.error('Error processing command:', err);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: 'error-' + Date.now(),
+          role: 'assistant',
+          content: "Sorry, I had trouble parsing that. Try something like 'Dhruv had the nachos' or 'Sarah and Sue shared the pizza'.",
+          timestamp: Date.now(),
+        },
+      ]);
+    } finally {
+      setIsChatLoading(false);
+    }
+  };
+
+  // Reset all assignments
+  const handleResetAssignments = () => {
+    setCurrentReceipt((prev) => ({
+      ...prev,
+      items: prev.items.map((it) => ({ ...it, assignedTo: [] })),
+    }));
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: 'reset-' + Date.now(),
+        role: 'system',
+        content: '🔄 Cleared all item assignments. Ready for a new split!',
+        timestamp: Date.now(),
+      },
+    ]);
+    showToast('All item assignments cleared');
+  };
+
+  // Share summary via clipboard
+  const handleShare = () => {
+    const text = generateShareText(summary, currentReceipt.merchantName);
+    navigator.clipboard.writeText(text);
+    showToast('Breakdown copied to clipboard!');
+  };
+
+  // Split all unassigned items equally among known participants
+  const handleSplitAllUnassigned = () => {
+    if (summary.participants.length === 0) {
+      showToast('Please assign at least one person first!');
       return;
     }
-  } catch (error: any) {
-    console.error('Error in chat-command:', error);
-    res.status(500).json({ error: error?.message || 'Server error' });
-  }
-});
 
-// Setup Vite or static serving
-async function startServer() {
-  if (!isProduction) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
+    setCurrentReceipt((prev) => ({
+      ...prev,
+      items: prev.items.map((it) =>
+        it.assignedTo.length === 0
+          ? { ...it, assignedTo: [...summary.participants] }
+          : it
+      ),
+    }));
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`SplitSense AI Server running at http://0.0.0.0:${PORT}`);
-  });
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: 'split-all-' + Date.now(),
+        role: 'assistant',
+        content: `Split all ${summary.unassignedItemsCount} unassigned dish(es) equally among ${summary.participants.join(', ')}!`,
+        timestamp: Date.now(),
+      },
+    ]);
+    showToast('Unassigned items distributed equally!');
+  };
+
+  // Tip adjustments
+  const handleUpdateTipPercentage = (percentage: number) => {
+    const calculatedTip =
+      Math.round(summary.totalSubtotal * (percentage / 100) * 100) / 100;
+    setCurrentReceipt((prev) => ({
+      ...prev,
+      tip: calculatedTip,
+      tipType: 'percentage',
+      tipPercentage: percentage,
+      total: prev.subtotal + prev.tax + calculatedTip,
+    }));
+  };
+
+  const handleUpdateTipAmount = (amount: number) => {
+    setCurrentReceipt((prev) => ({
+      ...prev,
+      tip: amount,
+      tipType: 'amount',
+      total: prev.subtotal + prev.tax + amount,
+    }));
+  };
+
+  // Tax adjustment
+  const handleUpdateTax = (tax: number) => {
+    setCurrentReceipt((prev) => ({
+      ...prev,
+      tax,
+      total: prev.subtotal + tax + prev.tip,
+    }));
+  };
+
+  // Manual Add Item
+  const handleAddItem = (newItem: Omit<ReceiptItem, 'id' | 'assignedTo'>) => {
+    const item: ReceiptItem = {
+      ...newItem,
+      id: 'custom-item-' + Date.now(),
+      assignedTo: [],
+    };
+    setCurrentReceipt((prev) => {
+      const items = [...prev.items, item];
+      return normaliseReceiptTotals({ ...prev, items });
+    });
+    showToast(`Added ${newItem.name}`);
+  };
+
+  // Delete item
+  const handleDeleteItem = (itemId: string) => {
+    setCurrentReceipt((prev) => {
+      const items = prev.items.filter((it) => it.id !== itemId);
+      return normaliseReceiptTotals({ ...prev, items });
+    });
+  };
+
+  // Save manual assignees from modal
+  const handleSaveAssignees = (itemId: string, assignees: string[]) => {
+    setCurrentReceipt((prev) => ({
+      ...prev,
+      items: prev.items.map((it) => (it.id === itemId ? { ...it, assignedTo: assignees } : it)),
+    }));
+    setKnownParticipants((prev) => Array.from(new Set([...prev, ...assignees])));
+    showToast('Item assignees updated');
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-teal-500 selection:text-slate-950">
+      {/* Toast Notification */}
+      {toastMessage && (
+        <div className="fixed top-16 right-5 z-50 bg-teal-600 text-white text-xs font-semibold px-4 py-2.5 rounded-xl shadow-xl flex items-center space-x-2 animate-in fade-in slide-in-from-top-2">
+          <Check className="w-4 h-4 stroke-3" />
+          <span>{toastMessage}</span>
+        </div>
+      )}
+
+      {/* App Header */}
+      <Header
+        currentReceipt={currentReceipt}
+        summary={summary}
+        onSelectSample={handleSelectSample}
+        onOpenUpload={() => setIsUploadModalOpen(true)}
+        onResetAssignments={handleResetAssignments}
+        onShare={handleShare}
+      />
+
+      {/* Mobile Tab Switcher */}
+      <div className="md:hidden flex border-b border-slate-800 bg-slate-900 z-20 shrink-0">
+        <button
+          onClick={() => setMobileActiveTab('receipt')}
+          className={`flex-1 py-2.5 text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer border-b-2 transition-colors ${
+            mobileActiveTab === 'receipt'
+              ? 'border-teal-400 text-teal-400 bg-slate-800/40'
+              : 'border-transparent text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <ReceiptIcon className="w-3.5 h-3.5" />
+          <span>Receipt ({currentReceipt.items.length})</span>
+        </button>
+        <button
+          onClick={() => setMobileActiveTab('chat')}
+          className={`flex-1 py-2.5 text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer border-b-2 transition-colors ${
+            mobileActiveTab === 'chat'
+              ? 'border-teal-400 text-teal-400 bg-slate-800/40'
+              : 'border-transparent text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <MessageSquare className="w-3.5 h-3.5" />
+          <span>Smart Chat & Split</span>
+          {summary.percentAssigned > 0 && (
+            <span className="text-[10px] bg-teal-500/20 text-teal-300 px-1.5 py-0.2 rounded-full">
+              {summary.percentAssigned}%
+            </span>
+          )}
+        </button>
+      </div>
+
+      {/* Main Split-Screen Workspace */}
+      <main className="flex-1 flex flex-col md:grid md:grid-cols-2 overflow-hidden min-h-0">
+        {/* Left Pane: AI-Parsed Receipt */}
+        <section
+          className={`h-full overflow-hidden ${
+            mobileActiveTab === 'receipt' ? 'flex flex-col' : 'hidden md:flex md:flex-col'
+          }`}
+          aria-label="Receipt details pane"
+        >
+          <ReceiptPane
+            receipt={currentReceipt}
+            summary={summary}
+            onItemClick={(item) => setSelectedItemForAssign(item)}
+            onUpdateTipPercentage={handleUpdateTipPercentage}
+            onUpdateTipAmount={handleUpdateTipAmount}
+            onUpdateTax={handleUpdateTax}
+            onAddItem={() => setIsAddItemModalOpen(true)}
+            onDeleteItem={handleDeleteItem}
+            onSplitAllUnassigned={handleSplitAllUnassigned}
+          />
+        </section>
+
+        {/* Right Pane: Smart Chat & Real-Time Proportional Summary */}
+        <section
+          className={`h-full overflow-hidden flex flex-col bg-slate-950 ${
+            mobileActiveTab === 'chat' ? 'flex flex-col' : 'hidden md:flex md:flex-col'
+          }`}
+          aria-label="Smart chat and live breakdown pane"
+        >
+          {/* Upper: Multi-turn Chat */}
+          <div className="flex-1 min-h-[300px] overflow-hidden">
+            <ChatPane
+              messages={messages}
+              receipt={currentReceipt}
+              summary={summary}
+              isLoading={isChatLoading}
+              onSendMessage={handleSendMessage}
+              suggestedPrompts={suggestedPrompts}
+            />
+          </div>
+
+          {/* Lower: Real-Time Summary with proportional tax & tip */}
+          <div className="shrink-0 max-h-[45vh] overflow-y-auto">
+            <BreakdownSummary
+              summary={summary}
+              merchantName={currentReceipt.merchantName}
+              onSplitAllUnassigned={handleSplitAllUnassigned}
+            />
+          </div>
+        </section>
+      </main>
+
+      {/* Modals */}
+      <ReceiptUploadModal
+        isOpen={isUploadModalOpen}
+        onClose={() => setIsUploadModalOpen(false)}
+        onReceiptParsed={handleReceiptParsed}
+        onSelectSample={handleSelectSample}
+      />
+
+      <ItemAssignModal
+        item={selectedItemForAssign}
+        knownParticipants={knownParticipants}
+        onClose={() => setSelectedItemForAssign(null)}
+        onSaveAssignees={handleSaveAssignees}
+      />
+
+      <AddItemModal
+        isOpen={isAddItemModalOpen}
+        onClose={() => setIsAddItemModalOpen(false)}
+        onAddItem={handleAddItem}
+      />
+    </div>
+  );
 }
 
-startServer();
