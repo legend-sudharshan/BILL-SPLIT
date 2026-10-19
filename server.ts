@@ -1,0 +1,297 @@
+import express, { Request, Response } from 'express';
+import { GoogleGenAI, Type } from '@google/genai';
+import path from 'path';
+import dotenv from 'dotenv';
+import { parseCommandLocally } from './src/utils/commandParser.ts';
+import type { ReceiptData, ChatMessage } from './src/types/receipt.ts';
+
+dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const isProduction = process.env.NODE_ENV === 'production';
+
+// Parse large JSON payloads for base64 receipt images
+app.use(express.json({ limit: '30mb' }));
+app.use(express.urlencoded({ extended: true, limit: '30mb' }));
+
+// Initialize GoogleGenAI SDK server-side
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY || '',
+  httpOptions: {
+    headers: {
+      'User-Agent': 'aistudio-build',
+    },
+  },
+});
+
+/**
+ * Receipt image parser endpoint
+ */
+app.post('/api/parse-receipt', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { imageBase64, mimeType = 'image/jpeg' } = req.body;
+
+    if (!imageBase64) {
+      res.status(400).json({ error: 'No image provided' });
+      return;
+    }
+
+    // Clean base64 string if it contains data URI prefix
+    const base64Data = imageBase64.replace(/^data:image\/[a-zA-Z]+;base64,/, '');
+
+    const prompt = `Analyze this receipt photo. Extract all individual line items with their names, quantities, and prices.
+Also extract the merchant name, date/time if visible, subtotal, tax amount, and any tip if listed.
+Make sure item prices are numbers (e.g. 14.50, not "$14.50").
+If there are multiple identical items or combos, list them cleanly.
+Return the result in valid JSON.`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash',
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              inlineData: {
+                mimeType,
+                data: base64Data,
+              },
+            },
+            {
+              text: prompt,
+            },
+          ],
+        },
+      ],
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            merchantName: { type: Type.STRING },
+            date: { type: Type.STRING },
+            items: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  name: { type: Type.STRING },
+                  price: { type: Type.NUMBER },
+                  quantity: { type: Type.INTEGER },
+                  category: { type: Type.STRING },
+                },
+                required: ['name', 'price'],
+              },
+            },
+            subtotal: { type: Type.NUMBER },
+            tax: { type: Type.NUMBER },
+            tip: { type: Type.NUMBER },
+            total: { type: Type.NUMBER },
+          },
+          required: ['merchantName', 'items'],
+        },
+      },
+    });
+
+    const text = response.text || '{}';
+    const parsed = JSON.parse(text);
+
+    // Format into standard ReceiptData format
+    const receiptData: ReceiptData = {
+      id: 'receipt-' + Date.now(),
+      merchantName: parsed.merchantName || 'Restaurant Receipt',
+      date: parsed.date || new Date().toLocaleString(),
+      items: (parsed.items || []).map((item: any, idx: number) => ({
+        id: `parsed-item-${idx + 1}`,
+        name: item.name || `Item ${idx + 1}`,
+        price: Number(item.price) || 0,
+        quantity: Number(item.quantity) || 1,
+        assignedTo: [],
+        category: item.category || 'General',
+      })),
+      subtotal: Number(parsed.subtotal) || 0,
+      tax: Number(parsed.tax) || 0,
+      tip: Number(parsed.tip) || 0,
+      tipType: 'percentage',
+      tipPercentage: 18,
+      total: Number(parsed.total) || 0,
+    };
+
+    // Calculate subtotal if not provided
+    if (!receiptData.subtotal || receiptData.subtotal === 0) {
+      receiptData.subtotal = receiptData.items.reduce(
+        (sum, it) => sum + it.price * (it.quantity || 1),
+        0
+      );
+    }
+    // Set default total if missing
+    if (!receiptData.total || receiptData.total === 0) {
+      receiptData.total = receiptData.subtotal + receiptData.tax + receiptData.tip;
+    }
+
+    res.json({ success: true, receipt: receiptData });
+  } catch (error: any) {
+    console.error('Error parsing receipt with Gemini:', error);
+    res.status(500).json({
+      error: 'Failed to parse receipt image. ' + (error?.message || ''),
+    });
+  }
+});
+
+/**
+ * Natural language chat command endpoint
+ */
+app.post('/api/chat-command', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { message, receipt, conversation = [], knownParticipants = [] } = req.body;
+
+    if (!message || !receipt) {
+      res.status(400).json({ error: 'Message and receipt are required' });
+      return;
+    }
+
+    // Try Gemini first
+    try {
+      const itemsContext = (receipt.items || []).map((i: any) => ({
+        id: i.id,
+        name: i.name,
+        price: i.price,
+        quantity: i.quantity,
+        assignedTo: i.assignedTo,
+      }));
+
+      const systemInstruction = `You are SplitSense AI, an intelligent split-screen bill splitting assistant.
+Your job is to parse the user's natural language command, adjust who ordered what on the receipt, and answer their questions.
+Current Receipt Items:
+${JSON.stringify(itemsContext, null, 2)}
+Subtotal: $${receipt.subtotal}, Tax: $${receipt.tax}, Tip: $${receipt.tip}.
+Known Participants: ${JSON.stringify(knownParticipants)}
+
+When users say things like:
+- "Dhruv had the nachos" -> match "nachos" to the item ID (e.g. "Loaded Beef Nachos"), set assignedTo = ["Dhruv"].
+- "Sarah and Sue shared the pizza" -> match "pizza", set assignedTo = ["Sarah", "Sue"].
+- "Alex and Bob split the drinks" -> match drink item(s), set assignedTo = ["Alex", "Bob"].
+- "Actually Sarah didn't have the nachos" -> remove Sarah from the nachos item.
+- "Add 20% tip" / "Tip is $15" -> update tip.
+- "Split the unassigned items equally" -> assign all items that currently have assignedTo.length == 0 to all known participants.
+
+Provide your response strictly in the specified JSON schema.
+- reply: A friendly, concise 1-2 sentence response explaining what was updated.
+- itemUpdates: Array of { itemId, assignedTo, action: "replace" | "add" | "remove" }.
+- tipUpdate: Optional { type: "percentage" | "amount", value: number }.
+- newParticipants: Array of string names newly mentioned.
+- suggestedActions: Array of 2-3 quick follow-up prompt suggestions.`;
+
+      // Build conversation history for multi-turn chat
+      const contents: any[] = [];
+      const recentHistory = (conversation as ChatMessage[]).slice(-6);
+      recentHistory.forEach((msg) => {
+        contents.push({
+          role: msg.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text: msg.content }],
+        });
+      });
+      // Append current message
+      contents.push({
+        role: 'user',
+        parts: [{ text: message }],
+      });
+
+      const geminiResponse = await ai.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              reply: { type: Type.STRING },
+              itemUpdates: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    itemId: { type: Type.STRING },
+                    assignedTo: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING },
+                    },
+                    action: { type: Type.STRING },
+                  },
+                  required: ['itemId', 'assignedTo'],
+                },
+              },
+              tipUpdate: {
+                type: Type.OBJECT,
+                properties: {
+                  type: { type: Type.STRING },
+                  value: { type: Type.NUMBER },
+                },
+              },
+              newParticipants: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+              },
+              suggestedActions: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+              },
+            },
+            required: ['reply', 'itemUpdates'],
+          },
+        },
+      });
+
+      const text = geminiResponse.text || '{}';
+      const parsed = JSON.parse(text);
+
+      res.json({
+        reply: parsed.reply,
+        itemUpdates: parsed.itemUpdates || [],
+        tipUpdate: parsed.tipUpdate,
+        newParticipants: parsed.newParticipants || [],
+        suggestedActions: parsed.suggestedActions || [
+          'Split unassigned items equally',
+          'Add 18% tip',
+          'Who owes what?',
+        ],
+      });
+      return;
+    } catch (geminiError) {
+      console.warn('Gemini chat command error, falling back to local NLP parser:', geminiError);
+      // Fallback to local rule engine
+      const localResult = parseCommandLocally(message, receipt, knownParticipants);
+      res.json(localResult);
+      return;
+    }
+  } catch (error: any) {
+    console.error('Error in chat-command:', error);
+    res.status(500).json({ error: error?.message || 'Server error' });
+  }
+});
+
+// Setup Vite or static serving
+async function startServer() {
+  if (!isProduction) {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.resolve(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`SplitSense AI Server running at http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer();

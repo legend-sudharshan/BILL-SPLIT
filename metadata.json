@@ -1,0 +1,6 @@
+{
+  "name": "SplitSense AI - Smart Split-Screen Receipt & Bill Splitter",
+  "description": "Split-screen bill splitting app with AI receipt parsing, natural language command chat, and real-time proportional tax and tip distribution.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
